@@ -782,3 +782,13 @@ exports.getTenant = async (req, res, next) => {
     }
 
     if (!tenant.isActive) {
+      return res.status(403).json({ success: false, message: 'Tenant is not active' });
+    }
+
+    req.tenant = tenant;
+    next();
+  } catch (err) {
+    next(err);
+  }
+};
+
