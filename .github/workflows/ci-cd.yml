@@ -1,0 +1,207 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      mongo:
+        image: mongo:latest
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd mongosh --eval "db.adminCommand('ping')"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    strategy:
+      matrix:
+        node-version: [16.x, 18.x]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd client && npm ci
+        cd ../server && npm ci
+
+    - name: Run client tests
+      run: |
+        cd client
+        npm test -- --coverage --watchAll=false
+        npm run build
+      env:
+        CI: true
+
+    - name: Run server tests
+      run: |
+        cd server
+        npm test -- --coverage --watchAll=false
+      env:
+        NODE_ENV: test
+        MONGO_URI: mongodb://localhost:27017/elearning_test
+        JWT_SECRET: test-jwt-secret
+        PORT: 5001
+
+    - name: Upload client coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./client/coverage/lcov.info
+        flags: client
+        name: client-coverage
+        fail_ci_if_error: false
+
+    - name: Upload server coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./server/coverage/lcov.info
+        flags: server
+        name: server-coverage
+        fail_ci_if_error: false
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd client && npm ci
+        cd ../server && npm ci
+
+    - name: Run npm audit
+      run: |
+        npm audit --audit-level moderate
+        cd client && npm audit --audit-level moderate
+        cd ../server && npm audit --audit-level moderate
+
+    - name: Run Snyk to check for vulnerabilities
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+        command: test
+
+  build-and-deploy:
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18.x'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd client && npm ci
+        cd ../server && npm ci
+
+    - name: Build client
+      run: |
+        cd client
+        npm run build
+      env:
+        REACT_APP_API_URL: ${{ secrets.REACT_APP_API_URL }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, tag, and push server image to Amazon ECR
+      id: build-image-server
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: elearning-server
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Dockerfile.server .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+    - name: Build, tag, and push client image to Amazon ECR
+      id: build-image-client
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: elearning-client
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Dockerfile.client .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+    - name: Fill in the new image ID in the ECS task definition
+      id: task-def-server
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition-server.json
+        container-name: elearning-server
+        image: ${{ steps.build-image-server.outputs.image }}
+
+    - name: Fill in the new image ID in the ECS task definition
+      id: task-def-client
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition-client.json
+        container-name: elearning-client
+        image: ${{ steps.build-image-client.outputs.image }}
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def-server.outputs.task-definition }}
+        service: elearning-server
+        cluster: elearning-cluster
+        wait-for-service-stability: true
+
+    - name: Deploy Amazon ECS task definition
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def-client.outputs.task-definition }}
+        service: elearning-client
+        cluster: elearning-cluster
+        wait-for-service-stability: true
+
+    - name: Run database migrations
+      run: |
+        # This would typically run a script to apply database migrations
+        echo "Running database migrations..."
+        # npm run migrate
